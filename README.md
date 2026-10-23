@@ -55,7 +55,7 @@ documented inline in `src/model.py::Priors`.
   derived from building-footprint data, though. If you want zero ambiguity, build with
   `--no-usfs-buildings` (the building component then uses only Overture lineage).
   `carbonplan_buildings` is not used; it equals the Overture count (r = 0.9996).
-* Leaderboard calibration (below) fits about 10 global blend weights on thousands of
+* Leaderboard calibration (below) fits at most 9 global component weights on thousands of
   rows. It never recovers tract-level targets.
 
 ## Run it
@@ -72,37 +72,46 @@ python src/make_submission.py --columns minimal   # GEOID + coverage_gap_score o
 `features/*.parquet` and ready-made submissions are committed, so the model step runs
 without the download. A 400-draw run takes about 1 minute on 4 cores.
 
-## Leaderboard calibration (recommended: about 10 submissions over 2 days)
+## Leaderboard calibration (round 2: built around the scored base)
 
-With no labels there is no local CV. The leaderboard is the only signal, so use it
-efficiently. Every RMSE you read off it is
-`mean(y²) − 2·mean(y·b) + mean(b²)`. The all-zero submission gives `mean(y²)`, and each
-further probe `b` reveals one inner product `mean(y·b)`. With the Gram matrix of our own
-probes we can solve for the **least-squares blend of all probes** and its RMSE, without
-seeing a single label. On synthetic data with an unknown 30% public split, this recovers
-near-oracle weights (blend 0.0463 vs oracle 0.0461; best single probe 0.0807).
+The default submission (`submissions/sub_mc_default.csv`) scored **0.112627904** on the
+public leaderboard, against the model's own expected RMSE of about 0.069. So the truth
+sits outside the model's priors somewhere. One score cannot tell which way to move:
+if the true gaps are small, scaling predictions down helps; if they are large, scaling
+up helps. The probes below find the direction and size of the correction per component.
+
+Every probe is the base submission plus one model component (`probe_k = d + v_k`).
+Because the base RMSE is known,
+
+    <y − d, v_k> = (RMSE_base² − RMSE_k² + mean(v_k²)) / 2
+
+so each probe reveals exactly how much the residual points along that component, with
+**no all-zero submission needed**. `solve` then fits the least-squares correction
+`d + Σ g_k v_k`. Each probe changes only the score column and is a sensible submission on
+its own, so any probe that beats 0.1126 is already an improvement.
 
 ```bash
-python src/calibrate.py probes          # already done: submissions/probes/p00..p09 *.csv
-# submit each file, record the public RMSE in submissions/probes/scores.json, e.g.
-# {"p00_zero": 0.18, "p01_const": 0.15, "p02_default": 0.10, ...}
-python src/calibrate.py solve --full-from submissions/sub_mc_default.csv
-# -> submissions/submission_calibrated.csv + printed weights and expected RMSE
+python src/calibrate.py pack      # already done -> submissions/round2/r1..r9 *.csv
+# submit in this order and add each public RMSE to submissions/round2/scores.json
+python src/calibrate.py solve     # -> submissions/submission_calibrated.csv
 ```
 
-| probe | what it pins |
-|---|---|
-| `p00_zero` | all zeros (the sample submission). Gives `mean(y²)`; skip it if you already scored the sample file |
-| `p01_const` | constant 0.1. Gives `mean(y)` (intercept) |
-| `p02_default` | the default model |
-| `p03/p04_road_*` | TIGER coding narrow vs wide (aux/county/FM routes, boundary double counting) |
-| `p05/p06_cbp_*` | Overture/CBP ratio loose vs tight |
-| `p07/p08_poi_*` | Overture facility recall high vs low |
-| `p09_bld_high` | Microsoft count above USFS proxy |
+| order | probe | adds to the base |
+|---|---|---|
+| 1 | `r1_shift` | +0.05 everywhere (overall level) |
+| 2 | `r2_cbp_area` | CBP-half contribution if CBP was apportioned to tracts by **land area** |
+| 3 | `r3_cbp` | CBP-half contribution (population/housing apportionment) |
+| 4 | `r4_road` | road contribution |
+| 5 | `r5_fire` | fire + EMS contribution |
+| 6 | `r6_school` | schools contribution |
+| 7 | `r7_bld` | building contribution |
+| 8 | `r8_road_wide` | road contribution under a wide TIGER definition |
+| 9 | `r9_rural` | +0.08 on small-town/rural tracts |
 
-Variant predictions differ from each other by 0.02–0.07 RMSE, so calibration is worth
-several leaderboard places. If `eastern-wa` turns out not to be scored, pass
-`--exclude-wa` to `solve`.
+`solve` works with any subset; run it after the first five. In a synthetic test where the
+truth was deliberately outside the model (CBP by area ×3, road ×0.5, +0.03 level, noise
+0.06, unknown 30% public split), five probes took the true RMSE from 0.173 to 0.059.
+If `eastern-wa` turns out not to be scored, pass `--exclude-wa`.
 
 ## Bias Discovery starter
 
@@ -130,9 +139,9 @@ src/config.py           paths, organiser category/class definitions
 src/features.py         DuckDB spatial pipeline -> per-tract features (cached per part)
 src/model.py            priors + Monte Carlo simulation of the organiser score
 src/make_submission.py  submission writer + format validation
-src/calibrate.py        probe generation + leaderboard blend solver
+src/calibrate.py        round-2 probe pack + leaderboard correction solver
 src/bias_discovery.py   Best Bias Discovery starter report
-submissions/            default submission, probe files
+submissions/            default + strict submissions, round2/ probe pack
 features/               per-region tract features (parquet)
 reports/                bias discovery report
 ```

@@ -111,6 +111,7 @@ class Priors:
     cbp_county_sigma: tuple = (0.05, 0.25)
     cbp_tract_sigma: tuple = (0.05, 0.35)
     cbp_share_pop_prob: float = 0.5        # else ACS housing-unit share
+    cbp_share_area_prob: float = 0.0       # apportion by land area instead (checked first)
 
     def update(self, d: dict) -> "Priors":
         for k, v in d.items():
@@ -188,6 +189,7 @@ def _u(rng, lo_hi, size=None):
 
 
 HMAX = 25
+CONTRIB = ["road", "bld", "fire", "ems", "school", "cbp"]
 
 
 def _log_pois(k, lam):
@@ -251,12 +253,14 @@ def simulate(df: pd.DataFrame, priors: Priors | None = None, n_draws: int = 300,
     c_places = np.bincount(c_codes, o_all, n_c)
     c_pop = np.bincount(c_codes, pop, n_c)
     c_hu = np.bincount(c_codes, hu, n_c)
+    area = df.ALAND.fillna(df.area_m2).to_numpy().astype(float)
+    c_area = np.bincount(c_codes, area, n_c)
     c_reg = np.zeros(n_c, int)
     c_reg[c_codes] = reg_codes
 
     acc = {k: np.zeros(n) for k in ["score", "w", "road", "road_d", "bld", "bld_d", "poi", "poi_d",
                                     "fire", "fire_d", "ems", "ems_d", "school", "school_d",
-                                    "cbp", "cbp_d", "hifld", "hifld_d"]}
+                                    "cbp", "cbp_d", "hifld", "hifld_d"] + [f"C_{c}" for c in CONTRIB]}
     draws = []
     for d in range(n_draws):
         R = lambda key: _u(rng, getattr(priors, key), n_reg)[reg_codes]  # noqa: E731
@@ -313,7 +317,11 @@ def simulate(df: pd.DataFrame, priors: Priors | None = None, n_draws: int = 300,
         rate = _u(rng, priors.cbp_pop_rate, n_reg)[c_reg]
         c_cbp = (np.maximum(c_places / ratio, 1e-9) ** mix * np.maximum(c_pop * rate, 1e-9) ** (1 - mix)
                  * np.exp(rng.normal(0, sc, n_c) - sc ** 2 / 2))
-        if rng.uniform() < priors.cbp_share_pop_prob:
+        u = rng.uniform()
+        pa = priors.cbp_share_area_prob
+        if u < pa:
+            share = np.divide(area, c_area[c_codes], out=np.zeros(n), where=c_area[c_codes] > 0)
+        elif u < pa + (1 - pa) * priors.cbp_share_pop_prob:
             share = np.divide(pop, c_pop[c_codes], out=np.zeros(n), where=c_pop[c_codes] > 0)
         else:
             share = np.divide(hu, c_hu[c_codes], out=np.zeros(n), where=c_hu[c_codes] > 0)
@@ -333,6 +341,15 @@ def simulate(df: pd.DataFrame, priors: Priors | None = None, n_draws: int = 300,
 
         acc["score"] += score * any_d
         acc["w"] += any_d
+        # additive decomposition of the composite: score = sum of C_* exactly
+        inv_nd = np.where(any_d, 1 / np.maximum(nd, 1), 0.0)
+        inv_poi = np.where(poi_d, 1 / np.maximum(np_, 1), 0.0) * inv_nd
+        inv_h = np.where(hifld_d, 1 / np.maximum(nh, 1), 0.0) * inv_poi
+        acc["C_road"] += road * road_d * inv_nd
+        acc["C_bld"] += bld * bld_d * inv_nd
+        acc["C_cbp"] += cbp * cbp_d * inv_poi
+        for k in ("fire", "ems", "school"):
+            acc[f"C_{k}"] += parts[k] * defs[k] * inv_h
         for k, v, dd in [("road", road, road_d), ("bld", bld, bld_d), ("poi", poi, poi_d),
                          ("fire", parts["fire"], defs["fire"]), ("ems", parts["ems"], defs["ems"]),
                          ("school", parts["school"], defs["school"]), ("cbp", cbp, cbp_d),
@@ -347,6 +364,8 @@ def simulate(df: pd.DataFrame, priors: Priors | None = None, n_draws: int = 300,
     for k in ["road", "bld", "poi", "fire", "ems", "school", "cbp", "hifld"]:
         out[f"E_{k}"] = acc[k] / np.maximum(acc[k + "_d"], 1)
         out[f"P_{k}"] = acc[k + "_d"] / n_draws
+    for c in CONTRIB:
+        out[f"C_{c}"] = acc[f"C_{c}"] / np.maximum(acc["w"], 1)
     if return_draws:
         return out, np.stack(draws, 1)
     return out

@@ -1,0 +1,25 @@
+{
+ "base": "/home/user/Bias-Bounty-Mapping-Equity-Challenge/submissions/sub_mc_default.csv",
+ "order": [
+  "r1_shift",
+  "r2_cbp_area",
+  "r3_cbp",
+  "r4_road",
+  "r5_fire",
+  "r6_school",
+  "r7_bld",
+  "r8_road_wide",
+  "r9_rural"
+ ],
+ "what": {
+  "r1_shift": "constant +0.05 (overall level)",
+  "r2_cbp_area": "+ CBP-half contribution with CBP apportioned by LAND AREA",
+  "r3_cbp": "+ CBP-half contribution (pop/housing apportionment, as in base)",
+  "r4_road": "+ road contribution",
+  "r5_fire": "+ fire+EMS contribution",
+  "r6_school": "+ schools contribution",
+  "r7_bld": "+ building contribution",
+  "r8_road_wide": "+ road contribution under a wide TIGER definition (county routes, boundary double count)",
+  "r9_rural": "+0.08 on RUCA small-town / rural tracts"
+ }
+}

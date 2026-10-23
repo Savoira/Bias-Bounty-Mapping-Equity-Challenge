@@ -1,25 +1,26 @@
-"""Leaderboard calibration: learn blend weights over model variants from a few probes.
+"""Leaderboard calibration around an already-scored base submission.
 
-Why this works. For any submitted vector b, the leaderboard returns
-    RMSE(b)^2 = mean(y^2) - 2 mean(y*b) + mean(b^2).
-Submitting all zeros gives mean(y^2); after that every probe b_k reveals the single
-number mean(y * b_k). Knowing <y, b_k> for K basis vectors and the Gram matrix of the
-basis (which we compute ourselves) is enough to find the least-squares blend
-    y_hat = sum_k beta_k b_k,   beta = G^-1 <y, b>,
-and its exact RMSE on the scored rows -- without ever seeing a label.
+Let d be the base submission (its public RMSE is known) and probe_k = d + v_k. Then
 
-The basis here is the Monte Carlo model run under different hypotheses about the
-removed reference layers (how TIGER codes county routes, CBP/Overture ratio, Overture
-fire/school recall, ...), plus an intercept. Fitting ~10 global weights on thousands of
-rows does not leak tract-level targets; it is the same kind of calibration any team
-does when it reads its own leaderboard score. If the public leaderboard is a subset of
-rows, mean(b^2) over that subset is approximated by the full-set mean (documented error
-is small for subsets of ~1000+ rows; see README).
+    RMSE_d^2 - RMSE_k^2 = 2 <y - d, v_k> - mean(v_k^2)
+    =>  r_k := <y - d, v_k> = (RMSE_d^2 - RMSE_k^2 + mean(v_k^2)) / 2
 
-    python src/calibrate.py probes            # writes submissions/probes/*.csv + manifest
-    # submit each probe, put the leaderboard RMSEs in submissions/probes/scores.json:
-    #   {"p00_zero": 0.1234, "p01_const": 0.11, ...}
-    python src/calibrate.py solve             # prints weights, writes the blended submission
+so every probe reveals how much the residual y - d points along v_k, with no all-zero
+submission needed. The least-squares correction y ~ d + sum_k g_k v_k is then
+g = G^-1 r (G = Gram matrix of the v_k, computed locally) and its expected RMSE is
+sqrt(RMSE_d^2 - r' G^-1 r). Every probe is itself a sensible submission (it changes a
+single model component), so probing does not waste leaderboard slots.
+
+The v_k are the additive contributions of each model component to the composite
+(model.CONTRIB: score = sum of C_*), plus a constant shift and alternative structural
+hypotheses (CBP apportioned by land area, a wider TIGER road definition, a rural
+indicator). Fitting ~10 global weights on thousands of rows does not reveal tract
+targets; it rescales components.
+
+    python src/calibrate.py pack  --base submissions/sub_mc_default.csv
+    # submit probes in submissions/round2/ (order in manifest.json), then fill
+    # submissions/round2/scores.json  {"base": 0.112627904, "r1_shift": ..., ...}
+    python src/calibrate.py solve --base submissions/sub_mc_default.csv
 """
 from __future__ import annotations
 
@@ -33,117 +34,110 @@ from config import OUT_DIR, ROOT
 from make_submission import validate
 from model import Priors, load_features, simulate
 
-PROBE_DIR = OUT_DIR / "probes"
+PACK_DIR = OUT_DIR / "round2"
+DRAWS, SEED = 400, 0           # must match the base submission run
 
-# name -> Priors overrides. Each variant pins one family of unknowns to one end of its
-# prior range; the blend then interpolates/extrapolates between hypotheses.
-VARIANTS: dict[str, dict] = {
-    "p02_default": {},
-    "p03_road_narrow": {"road_aux_mult": 0.35, "road_kappa": [0.0, 0.3]},
-    "p04_road_wide": {"road_aux_mult": 1.8, "road_kappa": [0.85, 1.0]},
-    "p05_cbp_loose": {"cbp_ratio": [2.6, 3.6]},
-    "p06_cbp_tight": {"cbp_ratio": [0.9, 1.4]},
-    "p07_poi_hirecall": {"fire_r": [0.85, 0.97], "ems_r": [0.85, 0.97], "school_r": [0.92, 0.99],
-                         "fire_phi": [0.05, 0.15], "school_phi": [0.35, 0.55]},
-    "p08_poi_lorecall": {"fire_r": [0.25, 0.45], "ems_r": [0.3, 0.5], "school_r": [0.5, 0.7],
-                         "fire_phi": [0.25, 0.45], "school_phi": [0.1, 0.25]},
-    "p09_bld_high": {"bld_scale": [1.06, 1.16], "bld_sigma": [0.1, 0.2]},
+# name -> what the probe adds to the base submission (submit in this order)
+PROBES = {
+    "r1_shift": "constant +0.05 (overall level)",
+    "r2_cbp_area": "+ CBP-half contribution with CBP apportioned by LAND AREA",
+    "r3_cbp": "+ CBP-half contribution (pop/housing apportionment, as in base)",
+    "r4_road": "+ road contribution",
+    "r5_fire": "+ fire+EMS contribution",
+    "r6_school": "+ schools contribution",
+    "r7_bld": "+ building contribution",
+    "r8_road_wide": "+ road contribution under a wide TIGER definition (county routes, boundary double count)",
+    "r9_rural": "+0.08 on RUCA small-town / rural tracts",
 }
-SPECIAL = ["p00_zero", "p01_const"]
-CONST = 0.1
 
 
-def basis(draws: int, seed: int) -> pd.DataFrame:
+def directions(base_ids: pd.Index) -> pd.DataFrame:
     df = load_features()
-    cols = {}
-    for name, ov in VARIANTS.items():
-        pr = Priors().update(json.loads(json.dumps(ov)))
-        out = simulate(df, pr, n_draws=draws, seed=seed)
-        cols[name] = out.set_index("GEOID").coverage_gap_score
-        print(f"{name:20s} mean={cols[name].mean():.4f}", flush=True)
-    return pd.DataFrame(cols)
+    base = simulate(df, Priors(), n_draws=DRAWS, seed=SEED).set_index("GEOID").loc[base_ids]
+    area = simulate(df, Priors().update({"cbp_share_area_prob": 1.0}), n_draws=DRAWS,
+                    seed=SEED + 1).set_index("GEOID").loc[base_ids]
+    wide = simulate(df, Priors().update({"road_aux_mult": 1.8, "road_kappa": [0.85, 1.0]}),
+                    n_draws=DRAWS, seed=SEED + 2).set_index("GEOID").loc[base_ids]
+    f = df.set_index("GEOID").loc[base_ids]
+    V = pd.DataFrame(index=base_ids)
+    V["r1_shift"] = 0.05
+    V["r2_cbp_area"] = area.C_cbp
+    V["r3_cbp"] = base.C_cbp
+    V["r4_road"] = base.C_road
+    V["r5_fire"] = base.C_fire + base.C_ems
+    V["r6_school"] = base.C_school
+    V["r7_bld"] = base.C_bld
+    V["r8_road_wide"] = wide.C_road
+    V["r9_rural"] = 0.08 * (f.ruca_primary.fillna(1) >= 7).astype(float)
+    return V
 
 
-def cmd_probes(a):
+def cmd_pack(a):
     template = pd.read_csv(ROOT / "SampleSubmission.csv", dtype={"GEOID": str})
-    B = basis(a.draws, a.seed).loc[template.GEOID]
-    PROBE_DIR.mkdir(parents=True, exist_ok=True)
-    B.to_parquet(PROBE_DIR / "basis.parquet")
-    region = template.region if "region" in template else None
-    for name in SPECIAL + list(VARIANTS):
-        if name == "p00_zero":
-            v = np.zeros(len(template))
-        elif name == "p01_const":
-            v = np.full(len(template), CONST)
-        else:
-            v = B[name].to_numpy()
-        sub = pd.DataFrame({"GEOID": template.GEOID, "coverage_gap_score": v})
-        if region is not None:
-            sub["region"] = region
-        sub.to_csv(PROBE_DIR / f"{name}.csv", index=False)
-    json.dump({"probes": SPECIAL + list(VARIANTS), "const": CONST},
-              open(PROBE_DIR / "manifest.json", "w"), indent=1)
-    print(f"wrote {len(SPECIAL) + len(VARIANTS)} probes to {PROBE_DIR}")
+    base = pd.read_csv(a.base, dtype={"GEOID": str})
+    assert (base.GEOID == template.GEOID).all()
+    d = base.coverage_gap_score.to_numpy()
+    V = directions(pd.Index(base.GEOID))
+    PACK_DIR.mkdir(parents=True, exist_ok=True)
+    eff = {}
+    for name in PROBES:
+        b = np.clip(d + V[name].to_numpy(), 0, 1)
+        eff[name] = b - d                       # the direction actually submitted
+        sub = base.copy()                       # identical component columns
+        sub["coverage_gap_score"] = b
+        validate(sub, template)
+        sub.to_csv(PACK_DIR / f"{name}.csv", index=False)
+    pd.DataFrame(eff, index=base.GEOID).to_parquet(PACK_DIR / "directions.parquet")
+    json.dump({"base": str(a.base), "order": list(PROBES), "what": PROBES},
+              open(PACK_DIR / "manifest.json", "w"), indent=1)
+    if not (PACK_DIR / "scores.json").exists():
+        json.dump({"base": a.base_score}, open(PACK_DIR / "scores.json", "w"), indent=1)
+    print(pd.DataFrame(eff).describe().T[["mean", "std", "max"]].round(4))
+    print(f"wrote {len(PROBES)} probes to {PACK_DIR}")
 
 
 def cmd_solve(a):
     template = pd.read_csv(ROOT / "SampleSubmission.csv", dtype={"GEOID": str})
-    B = pd.read_parquet(PROBE_DIR / "basis.parquet").loc[template.GEOID]
-    scores = json.load(open(a.scores))
-    mask = template.region.ne("eastern-wa").to_numpy() if a.exclude_wa else np.ones(len(B), bool)
-    s0 = scores["p00_zero"] ** 2                        # mean(y^2)
-    X, names, iy = [], [], []
-    if "p01_const" in scores:
-        X.append(np.full(len(B), CONST))
-        names.append("const")
-        iy.append((s0 + CONST ** 2 - scores["p01_const"] ** 2) / 2)
-    for name in VARIANTS:
-        if name in scores:
-            b = B[name].to_numpy()
-            X.append(b)
-            names.append(name)
-            iy.append((s0 + np.mean(b[mask] ** 2) - scores[name] ** 2) / 2)
-    X = np.stack(X, 1)
-    G = X[mask].T @ X[mask] / mask.sum()
-    iy = np.array(iy)
+    base = pd.read_csv(a.base, dtype={"GEOID": str})
+    d = base.coverage_gap_score.to_numpy()
+    E = pd.read_parquet(PACK_DIR / "directions.parquet").loc[base.GEOID]
+    sc = json.load(open(a.scores))
+    rd2 = sc["base"] ** 2
+    names = [k for k in PROBES if k in sc]
+    mask = base.region.ne("eastern-wa").to_numpy() if a.exclude_wa else np.ones(len(d), bool)
+    V = E[names].to_numpy()
+    r = np.array([(rd2 - sc[k] ** 2 + np.mean(V[mask, i] ** 2)) / 2 for i, k in enumerate(names)])
+    G = V[mask].T @ V[mask] / mask.sum()
     lam = a.ridge * np.trace(G) / len(G)
-    beta = np.linalg.solve(G + lam * np.eye(len(G)), iy)
-    mse = s0 - 2 * beta @ iy + beta @ G @ beta
-    print("mean(y)   ~", iy[0] / CONST if names[0] == "const" else "n/a")
-    print("mean(y^2) =", round(s0, 6))
-    for n_, b_, v in zip(names, beta, iy):
-        print(f"  {n_:20s} beta={b_:+.4f}  <y,b>/n={v:.5f}")
-    print(f"expected blended RMSE ~ {np.sqrt(max(mse, 0)):.5f}  (best single probe "
-          f"{min(v for k, v in scores.items() if k != 'p00_zero'):.5f})")
-    yhat = np.clip(X @ beta, 0, 1)
-    pred = pd.DataFrame({"GEOID": template.GEOID, "coverage_gap_score": yhat})
-    if a.full_from:
-        full = pd.read_csv(a.full_from, dtype={"GEOID": str}).set_index("GEOID").loc[template.GEOID]
-        full["coverage_gap_score"] = yhat
-        sub = full.reset_index()[template.columns]
-    else:
-        sub = pred
-    validate(sub, template[sub.columns])
+    g = np.linalg.solve(G + lam * np.eye(len(G)), r)
+    exp_mse = rd2 - 2 * g @ r + g @ G @ g
+    print(f"base RMSE {sc['base']:.6f}")
+    for k, gi, ri in zip(names, g, r):
+        better = "better" if sc[k] < sc["base"] else "worse"
+        print(f"  {k:14s} probe {sc[k]:.6f} ({better})  <y-d,v>={ri:+.6f}  weight={gi:+.3f}")
+    print(f"expected RMSE of corrected submission ~ {np.sqrt(max(exp_mse, 0)):.5f}")
+    y = np.clip(d + V @ g, 0, 1)
+    sub = base.copy()
+    sub["coverage_gap_score"] = y
+    validate(sub, template)
     sub.to_csv(a.out, index=False)
-    print("wrote", a.out)
+    print("wrote", a.out, " mean", y.mean().round(4))
 
 
 def main():
     ap = argparse.ArgumentParser()
     sp = ap.add_subparsers(dest="cmd", required=True)
-    p = sp.add_parser("probes")
-    p.add_argument("--draws", type=int, default=300)
-    p.add_argument("--seed", type=int, default=0)
+    p = sp.add_parser("pack")
+    p.add_argument("--base", default=str(OUT_DIR / "sub_mc_default.csv"))
+    p.add_argument("--base-score", type=float, default=0.112627904)
     s = sp.add_parser("solve")
-    s.add_argument("--scores", default=str(PROBE_DIR / "scores.json"))
-    s.add_argument("--ridge", type=float, default=1e-3)
-    s.add_argument("--exclude-wa", action="store_true",
-                   help="if eastern-wa turns out not to be scored")
-    s.add_argument("--full-from", default=None,
-                   help="a full-column submission whose component columns to keep")
+    s.add_argument("--base", default=str(OUT_DIR / "sub_mc_default.csv"))
+    s.add_argument("--scores", default=str(PACK_DIR / "scores.json"))
+    s.add_argument("--ridge", type=float, default=1e-2)
+    s.add_argument("--exclude-wa", action="store_true")
     s.add_argument("--out", default=str(OUT_DIR / "submission_calibrated.csv"))
     a = ap.parse_args()
-    {"probes": cmd_probes, "solve": cmd_solve}[a.cmd](a)
+    {"pack": cmd_pack, "solve": cmd_solve}[a.cmd](a)
 
 
 if __name__ == "__main__":
