@@ -96,32 +96,78 @@ def cmd_pack(a):
     print(f"wrote {len(PROBES)} probes to {PACK_DIR}")
 
 
+def read_score(path) -> np.ndarray:
+    return pd.read_csv(path, dtype={"GEOID": str}).coverage_gap_score.to_numpy()
+
+
 def cmd_solve(a):
+    """Least-squares correction over EVERY scored submission in the registry.
+
+    Any scored file b gives <y - d, b - d> = (RMSE_d^2 - RMSE_b^2 + mean((b-d)^2)) / 2,
+    so all submissions ever made (probes, corrected files, new model versions) feed one
+    fit: y ~ d + sum_i g_i (b_i - d).
+    """
     template = pd.read_csv(ROOT / "SampleSubmission.csv", dtype={"GEOID": str})
     base = pd.read_csv(a.base, dtype={"GEOID": str})
     d = base.coverage_gap_score.to_numpy()
-    E = pd.read_parquet(PACK_DIR / "directions.parquet").loc[base.GEOID]
-    sc = json.load(open(a.scores))
-    rd2 = sc["base"] ** 2
-    names = [k for k in PROBES if k in sc]
+    reg = json.load(open(a.registry))
+    rd2 = reg[a.base] ** 2
     mask = base.region.ne("eastern-wa").to_numpy() if a.exclude_wa else np.ones(len(d), bool)
-    V = E[names].to_numpy()
-    r = np.array([(rd2 - sc[k] ** 2 + np.mean(V[mask, i] ** 2)) / 2 for i, k in enumerate(names)])
-    G = V[mask].T @ V[mask] / mask.sum()
+    names, U, r = [], [], []
+    for path, score in reg.items():
+        if path == a.base:
+            continue
+        u = read_score(path) - d
+        names.append(path)
+        U.append(u)
+        r.append((rd2 - score ** 2 + np.mean(u[mask] ** 2)) / 2)
+    U, r = np.stack(U, 1), np.array(r)
+    G = U[mask].T @ U[mask] / mask.sum()
     lam = a.ridge * np.trace(G) / len(G)
     g = np.linalg.solve(G + lam * np.eye(len(G)), r)
     exp_mse = rd2 - 2 * g @ r + g @ G @ g
-    print(f"base RMSE {sc['base']:.6f}")
-    for k, gi, ri in zip(names, g, r):
-        better = "better" if sc[k] < sc["base"] else "worse"
-        print(f"  {k:14s} probe {sc[k]:.6f} ({better})  <y-d,v>={ri:+.6f}  weight={gi:+.3f}")
-    print(f"expected RMSE of corrected submission ~ {np.sqrt(max(exp_mse, 0)):.5f}")
-    y = np.clip(d + V @ g, 0, 1)
+    best = min(reg.values())
+    print(f"base {a.base}: {reg[a.base]:.6f}   best scored so far: {best:.6f}")
+    for n_, gi, ri in zip(names, g, r):
+        print(f"  {n_:45s} {reg[n_]:.6f}  <y-d,u>={ri:+.6f}  weight={gi:+.3f}")
+    print(f"expected RMSE of fitted submission ~ {np.sqrt(max(exp_mse, 0)):.5f}")
+    y = np.clip(d + U @ g, 0, 1)
     sub = base.copy()
     sub["coverage_gap_score"] = y
     validate(sub, template)
     sub.to_csv(a.out, index=False)
     print("wrote", a.out, " mean", y.mean().round(4))
+
+
+V2_PRIORS = {"cbp_ratio": [80, 100], "cbp_mix": [1, 1], "ems_r": [0.85, 0.97]}
+
+
+def cmd_v2pack(a):
+    """Round 3: structural v2 model (CBP gap ~ 0, as the round-2 probes showed, and
+    EMS rarely binding, as the organiser README says) plus single-component probes
+    around it."""
+    template = pd.read_csv(ROOT / "SampleSubmission.csv", dtype={"GEOID": str})
+    base = pd.read_csv(a.base, dtype={"GEOID": str})
+    out = simulate(load_features(), Priors().update(V2_PRIORS), n_draws=DRAWS,
+                   seed=SEED).set_index("GEOID").loc[base.GEOID]
+    m = out.coverage_gap_score.to_numpy()
+    ok = base.region.eq("eastern-ok").to_numpy()
+    files = {
+        "v2_cbp0": m,
+        "v2_fire_half": m - 0.5 * (out.C_fire + out.C_ems).to_numpy(),
+        "v2_school_half": m - 0.5 * out.C_school.to_numpy(),
+        "v2_bld_half": m - 0.5 * out.C_bld.to_numpy(),
+        "v2_okroad_half": m - 0.5 * out.C_road.to_numpy() * ok,
+    }
+    d3 = OUT_DIR / "round3"
+    d3.mkdir(parents=True, exist_ok=True)
+    out.reset_index().to_parquet(d3 / "v2_pred.parquet")
+    for k, v in files.items():
+        sub = base.copy()
+        sub["coverage_gap_score"] = np.clip(v, 0, 1)
+        validate(sub, template)
+        sub.to_csv(d3 / f"{k}.csv", index=False)
+        print(f"{k:16s} mean={sub.coverage_gap_score.mean():.4f}")
 
 
 def main():
@@ -131,13 +177,15 @@ def main():
     p.add_argument("--base", default=str(OUT_DIR / "sub_mc_default.csv"))
     p.add_argument("--base-score", type=float, default=0.112627904)
     s = sp.add_parser("solve")
-    s.add_argument("--base", default=str(OUT_DIR / "sub_mc_default.csv"))
-    s.add_argument("--scores", default=str(PACK_DIR / "scores.json"))
-    s.add_argument("--ridge", type=float, default=1e-2)
+    s.add_argument("--base", default="submissions/sub_mc_default.csv")
+    s.add_argument("--registry", default="submissions/lb_scores.json")
+    s.add_argument("--ridge", type=float, default=1e-4)
     s.add_argument("--exclude-wa", action="store_true")
     s.add_argument("--out", default=str(OUT_DIR / "submission_calibrated.csv"))
+    v = sp.add_parser("v2pack")
+    v.add_argument("--base", default="submissions/sub_mc_default.csv")
     a = ap.parse_args()
-    {"pack": cmd_pack, "solve": cmd_solve}[a.cmd](a)
+    {"pack": cmd_pack, "solve": cmd_solve, "v2pack": cmd_v2pack}[a.cmd](a)
 
 
 if __name__ == "__main__":

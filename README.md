@@ -108,7 +108,18 @@ python src/calibrate.py solve     # -> submissions/submission_calibrated.csv
 | 8 | `r8_road_wide` | road contribution under a wide TIGER definition |
 | 9 | `r9_rural` | +0.08 on small-town/rural tracts |
 
-`solve` works with any subset; run it after the first five. In a synthetic test where the
+Every scored file goes into `submissions/lb_scores.json` (path → public RMSE), and
+`python src/calibrate.py solve` fits one correction over all of them: any submission `b`
+reveals `<y − d, b − d>`, so probes, corrected files and new model versions all count.
+
+Round-2 result: true scores average ≈ 0.056 (not 0.089), the CBP half contributes ≈ 0,
+and the road part is about right. The fitted correction has expected RMSE ≈ 0.072
+(`submissions/sub_cal_r2a.csv`). `calibrate.py v2pack` builds round 3 in
+`submissions/round3/`: a structural v2 model with the CBP gap ≈ 0 (mean 0.0557,
+independently matching the 0.056 the leaderboard implied) and single-component probes
+around it.
+
+`solve` works with any subset of probes. In a synthetic test where the
 truth was deliberately outside the model (CBP by area ×3, road ×0.5, +0.03 level, noise
 0.06, unknown 30% public split), five probes took the true RMSE from 0.173 to 0.059.
 If `eastern-wa` turns out not to be scored, pass `--exclude-wa`.
